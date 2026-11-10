@@ -1,0 +1,175 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Tensegrity Pose Extractor — Prototype</title>
+<style>
+body{font-family:system-ui,Segoe UI,Roboto,Arial;margin:20px;color:#222}
+textarea{width:100%;height:8em}
+input,button{padding:6px;margin:6px 0}
+pre{background:#f6f6f8;padding:10px;border-radius:6px;overflow:auto}
+small{color:#666}
+</style>
+</head>
+<body>
+<h2>Tensegrity Pose Extractor — Prototype</h2>
+<label>Page URL: <input id="url" placeholder="https://example.com/article.html" size=60></label>
+<br>
+<button id="run">Run Extraction</button>
+<small>Note: CORS may prevent fetching some pages/resources from the browser.</small>
+<h3>Output (standardized JSON)</h3>
+<pre id="out">{}</pre>
+
+<script>
+// Very small prototype. No dependencies. Works best when run against pages that allow cross-origin fetch.
+async function fetchText(u){
+  const r = await fetch(u); if(!r.ok) throw new Error('Fetch failed: '+r.status);
+  return await r.text();
+}
+
+function resolveUrl(base, href){
+  try{return new URL(href, base).href}catch(e){return null}
+}
+
+function parseCSV(text){
+  const lines = text.split(/\r?\n/).filter(Boolean);
+  const rows = lines.map(l=>{
+    // simple comma split; doesn't support quoted commas
+    return l.split(/,\s*/).map(s=>s.trim());
+  });
+  return rows;
+}
+
+function tableToJSON(tableEl){
+  const rows = Array.from(tableEl.rows).map(r=>Array.from(r.cells).map(c=>c.innerText.trim()));
+  if(rows.length===0) return null;
+  // If first row looks like headers, use them
+  const headers = rows[0].length>1 ? rows[0] : null;
+  const data = [];
+  const start = headers?1:0;
+  for(let i=start;i<rows.length;i++){
+    const row = rows[i];
+    if(headers){
+      const obj = {}; headers.forEach((h,j)=>obj[h||('col'+j)] = row[j] || null);
+      data.push(obj);
+    } else {
+      data.push({row: row});
+    }
+  }
+  return {headers: headers, data: data};
+}
+
+function makeProvenance(url, type){
+  return {source_url: url, retrieved_at: (new Date()).toISOString(), source_type: type};
+}
+
+async function extractFromPage(pageUrl){
+  const out = {page: pageUrl, items: []};
+  const html = await fetchText(pageUrl);
+  const parser = new DOMParser();
+  const doc = parser.parseFromString(html, 'text/html');
+
+  // find linked resources
+  const links = Array.from(doc.querySelectorAll('a[href]'));
+  const candidates = links.map(a=>({href: a.getAttribute('href'), text: a.innerText})).filter(l=>l.href);
+  for(const c of candidates){
+    const full = resolveUrl(pageUrl, c.href);
+    if(!full) continue;
+    const lower = full.toLowerCase();
+    if(lower.endsWith('.csv') || lower.endsWith('.json')){
+      try{
+        const txt = await fetchText(full);
+        let parsed = null; let schema = null;
+        if(lower.endsWith('.csv')){
+          const rows = parseCSV(txt);
+          parsed = {type:'csv',rows:rows};
+          schema = {format:'csv',rows:rows.length,cols: (rows[0]||[]).length};
+        } else {
+          parsed = {type:'json',obj: JSON.parse(txt)};
+          schema = {format:'json',keys: Object.keys(parsed.obj||{})};
+        }
+        out.items.push({kind:'linked_dataset', url:full, link_text:c.text, provenance: makeProvenance(full, 'downloaded_file'), parsed: parsed, schema: schema, confidence:0.95});
+      }catch(e){
+        out.items.push({kind:'linked_dataset', url:full, link_text:c.text, provenance: makeProvenance(full, 'download_failed'), error: String(e), confidence:0.2});
+      }
+    }
+  }
+
+  // If no direct datasets, scrape tables
+  if(out.items.length===0){
+    const tables = Array.from(doc.querySelectorAll('table'));
+    for(const t of tables){
+      const tableJson = tableToJSON(t);
+      if(!tableJson) continue;
+      // rudimentary detection: if headers contain 'x','y','z' or 'angle' etc, mark as pose-like
+      const headerText = (tableJson.headers||[]).join(' ').toLowerCase();
+      const poseHints = ['x','y','z','angle','theta','phi','roll','pitch','yaw','length'];
+      const hintCount = poseHints.reduce((s,h)=> s + (headerText.includes(h)?1:0), 0);
+      const confidence = Math.min(0.5 + hintCount*0.1, 0.95);
+      out.items.push({kind:'scraped_table', provenance: makeProvenance(pageUrl,'html_table'), table: tableJson, confidence: confidence});
+    }
+  }
+
+  // If still empty, record snippet of page text as low-confidence source
+  if(out.items.length===0){
+    const text = doc.body ? doc.body.innerText.slice(0,1000) : '';
+    out.items.push({kind:'page_text', provenance: makeProvenance(pageUrl,'html_page'), snippet: text, confidence:0.1});
+  }
+
+  // Build standardized 'pose' outputs where possible
+  out.poses = [];
+  for(const it of out.items){
+    if(it.kind==='linked_dataset'){
+      // if CSV with numeric columns, try to map columns to x,y,z if names match
+      if(it.parsed.type==='csv'){
+        const rows = it.parsed.rows;
+        const header = rows[0] || [];
+        const dataRows = rows.slice(1);
+        const cols = header.map(h=>h.toLowerCase());
+        const mapping = {x: cols.indexOf('x'), y: cols.indexOf('y'), z: cols.indexOf('z')};
+        const found = mapping.x!==-1 || mapping.y!==-1 || mapping.z!==-1;
+        if(found){
+          const points = dataRows.map(r=>({x: mapping.x>=0?parseFloat(r[mapping.x]):null, y: mapping.y>=0?parseFloat(r[mapping.y]):null, z: mapping.z>=0?parseFloat(r[mapping.z]):null}));
+          out.poses.push({source: it.url, kind:'point_cloud', points: points, provenance: it.provenance, confidence: it.confidence});
+        }
+      }
+      if(it.parsed.type==='json'){
+        // simplistic: if top-level is array of objects with x/y/z
+        if(Array.isArray(it.parsed.obj)){
+          const arr = it.parsed.obj;
+          const maybe = arr.filter(o=> o && (o.x!==undefined || o.y!==undefined || o.z!==undefined));
+          if(maybe.length>0){
+            out.poses.push({source: it.url, kind:'point_cloud', points: maybe, provenance: it.provenance, confidence: it.confidence});
+          }
+        }
+      }
+    }
+    if(it.kind==='scraped_table'){
+      // try to create a points array if headers include x/y
+      const headers = it.table.headers || [];
+      const cols = headers.map(h=>h.toLowerCase());
+      const ix = cols.indexOf('x'); const iy = cols.indexOf('y'); const iz = cols.indexOf('z');
+      if(ix!==-1 || iy!==-1 || iz!==-1){
+        const pts = it.table.data.map(r=>({x: ix>=0?parseFloat(r[''+headers[ix]]):null, y: iy>=0?parseFloat(r[''+headers[iy]]):null, z: iz>=0?parseFloat(r[''+headers[iz]]):null}));
+        out.poses.push({source: it.provenance.source_url, kind:'point_cloud', points: pts, provenance: it.provenance, confidence: it.confidence});
+      }
+    }
+  }
+
+  return out;
+}
+
+document.getElementById('run').addEventListener('click', async ()=>{
+  const url = document.getElementById('url').value.trim();
+  if(!url){alert('Enter a URL');return}
+  document.getElementById('out').textContent = 'Running...';
+  try{
+    const res = await extractFromPage(url);
+    document.getElementById('out').textContent = JSON.stringify(res,null,2);
+  }catch(e){
+    document.getElementById('out').textContent = 'Error: '+String(e);
+  }
+});
+</script>
+</body>
+</html>

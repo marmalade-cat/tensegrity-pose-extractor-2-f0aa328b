@@ -1,2 +1,7 @@
-# tensegrity-pose-extractor-2-f0aa328b
-tensegrity-pose-extractor-2 [marmalade-project:f0aa328b-38cc-4edb-b469-4b4c8933ce4a]
+Tensegrity Pose Extractor — prototype
+
+A tiny prototype that fetches a page, finds linked CSV/JSON files, downloads them, and otherwise scrapes HTML tables. Produces a small standardized JSON with provenance and simple confidence scores.
+
+Usage: open index.html in a modern browser. This is a client-only demo; CORS may block some fetches when testing with remote sites. Designed as a starting point for a more robust extractor.
+
+Limitations: no crawling, limited schema inference, basic confidence heuristics. See in-file comments.
